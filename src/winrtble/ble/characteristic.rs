@@ -11,15 +11,17 @@
 //
 // Copyright (c) 2014 The Rust Project Developers
 
-use super::super::utils::to_descriptor_value;
+use super::{super::utils::to_descriptor_value, descriptor::BLEDescriptor};
 use crate::{
+    Error, Result,
     api::{Characteristic, WriteType},
     winrtble::utils,
-    Error, Result,
 };
 
 use log::{debug, trace};
+use std::{collections::HashMap, future::IntoFuture};
 use uuid::Uuid;
+use windows::core::Ref;
 use windows::{
     Devices::Bluetooth::{
         BluetoothCacheMode,
@@ -28,15 +30,15 @@ use windows::{
             GattCommunicationStatus, GattValueChangedEventArgs, GattWriteOption,
         },
     },
-    Foundation::{EventRegistrationToken, TypedEventHandler},
+    Foundation::TypedEventHandler,
     Storage::Streams::{DataReader, DataWriter},
 };
 
 pub type NotifiyEventHandler = Box<dyn Fn(Vec<u8>) + Send>;
 
-impl Into<GattWriteOption> for WriteType {
-    fn into(self) -> GattWriteOption {
-        match self {
+impl From<WriteType> for GattWriteOption {
+    fn from(val: WriteType) -> Self {
+        match val {
             WriteType::WithoutResponse => GattWriteOption::WriteWithoutResponse,
             WriteType::WithResponse => GattWriteOption::WriteWithResponse,
         }
@@ -46,13 +48,18 @@ impl Into<GattWriteOption> for WriteType {
 #[derive(Debug)]
 pub struct BLECharacteristic {
     characteristic: GattCharacteristic,
-    notify_token: Option<EventRegistrationToken>,
+    pub descriptors: HashMap<Uuid, BLEDescriptor>,
+    notify_token: Option<i64>,
 }
 
 impl BLECharacteristic {
-    pub fn new(characteristic: GattCharacteristic) -> Self {
+    pub fn new(
+        characteristic: GattCharacteristic,
+        descriptors: HashMap<Uuid, BLEDescriptor>,
+    ) -> Self {
         BLECharacteristic {
             characteristic,
+            descriptors,
             notify_token: None,
         }
     }
@@ -62,8 +69,8 @@ impl BLECharacteristic {
         writer.WriteBytes(data)?;
         let operation = self
             .characteristic
-            .WriteValueWithOptionAsync(writer.DetachBuffer()?, write_type.into())?;
-        let result = operation.await?;
+            .WriteValueWithOptionAsync(&writer.DetachBuffer()?, write_type.into())?;
+        let result = operation.into_future().await?;
         if result == GattCommunicationStatus::Success {
             Ok(())
         } else {
@@ -77,6 +84,7 @@ impl BLECharacteristic {
         let result = self
             .characteristic
             .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)?
+            .into_future()
             .await?;
         if result.Status()? == GattCommunicationStatus::Success {
             let value = result.Value()?;
@@ -95,8 +103,8 @@ impl BLECharacteristic {
     pub async fn subscribe(&mut self, on_value_changed: NotifiyEventHandler) -> Result<()> {
         {
             let value_handler = TypedEventHandler::new(
-                move |_: &Option<GattCharacteristic>, args: &Option<GattValueChangedEventArgs>| {
-                    if let Some(args) = args {
+                move |_: Ref<GattCharacteristic>, args: Ref<GattValueChangedEventArgs>| {
+                    if let Ok(args) = args.ok() {
                         let value = args.CharacteristicValue()?;
                         let reader = DataReader::FromBuffer(&value)?;
                         let len = reader.UnconsumedBufferLength()? as usize;
@@ -119,6 +127,7 @@ impl BLECharacteristic {
         let status = self
             .characteristic
             .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+            .into_future()
             .await?;
         trace!("subscribe {:?}", status);
         if status == GattCommunicationStatus::Success {
@@ -132,13 +141,14 @@ impl BLECharacteristic {
 
     pub async fn unsubscribe(&mut self) -> Result<()> {
         if let Some(token) = &self.notify_token {
-            self.characteristic.RemoveValueChanged(token)?;
+            self.characteristic.RemoveValueChanged(*token)?;
         }
         self.notify_token = None;
         let config = GattClientCharacteristicConfigurationDescriptorValue::None;
         let status = self
             .characteristic
             .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+            .into_future()
             .await?;
         trace!("unsubscribe {:?}", status);
         if status == GattCommunicationStatus::Success {
@@ -158,9 +168,15 @@ impl BLECharacteristic {
         let uuid = self.uuid();
         let properties =
             utils::to_char_props(&self.characteristic.CharacteristicProperties().unwrap());
+        let descriptors = self
+            .descriptors
+            .values()
+            .map(|descriptor| descriptor.to_descriptor(service_uuid, uuid))
+            .collect();
         Characteristic {
             uuid,
             service_uuid,
+            descriptors,
             properties,
         }
     }
@@ -169,7 +185,7 @@ impl BLECharacteristic {
 impl Drop for BLECharacteristic {
     fn drop(&mut self) {
         if let Some(token) = &self.notify_token {
-            let result = self.characteristic.RemoveValueChanged(token);
+            let result = self.characteristic.RemoveValueChanged(*token);
             if let Err(err) = result {
                 debug!("Drop:remove_connection_status_changed {:?}", err);
             }

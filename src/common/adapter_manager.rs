@@ -13,7 +13,7 @@
 // Copyright (c) 2014 The Rust Project Developers
 use crate::api::{CentralEvent, Peripheral};
 use crate::platform::PeripheralId;
-use dashmap::{mapref::one::RefMut, DashMap};
+use dashmap::{DashMap, mapref::one::RefMut};
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 use std::pin::Pin;
@@ -44,11 +44,8 @@ where
     PeripheralType: Peripheral + 'static,
 {
     pub fn emit(&self, event: CentralEvent) {
-        match event {
-            CentralEvent::DeviceDisconnected(ref id) => {
-                self.peripherals.remove(id);
-            }
-            _ => {}
+        if let CentralEvent::DeviceDisconnected(ref id) = event {
+            self.peripherals.remove(id);
         }
 
         if let Err(lost) = self.events_channel.send(event) {
@@ -58,13 +55,7 @@ where
 
     pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = CentralEvent> + Send>> {
         let receiver = self.events_channel.subscribe();
-        Box::pin(BroadcastStream::new(receiver).filter_map(|x| async move {
-            if x.is_ok() {
-                Some(x.unwrap())
-            } else {
-                None
-            }
-        }))
+        Box::pin(BroadcastStream::new(receiver).filter_map(|x| async move { x.ok() }))
     }
 
     pub fn add_peripheral(&self, peripheral: PeripheralType) {
@@ -75,6 +66,10 @@ where
         self.peripherals.insert(peripheral.id(), peripheral);
     }
 
+    pub fn clear_peripherals(&self) {
+        self.peripherals.clear();
+    }
+
     pub fn peripherals(&self) -> Vec<PeripheralType> {
         self.peripherals
             .iter()
@@ -82,10 +77,12 @@ where
             .collect()
     }
 
+    // Only used on windows and macOS/iOS, so turn off deadcode so we don't get warnings on android/linux.
+    #[allow(dead_code)]
     pub fn peripheral_mut(
         &self,
         id: &PeripheralId,
-    ) -> Option<RefMut<PeripheralId, PeripheralType>> {
+    ) -> Option<RefMut<'_, PeripheralId, PeripheralType>> {
         self.peripherals.get_mut(id)
     }
 

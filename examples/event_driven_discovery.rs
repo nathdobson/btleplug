@@ -1,10 +1,11 @@
 // See the "macOS permissions note" in README.md before running this on macOS
 // Big Sur or later.
 
-use btleplug::api::{bleuuid::BleUuid, Central, CentralEvent, Manager as _, ScanFilter};
+use btleplug::api::{
+    Central, CentralEvent, Manager as _, Peripheral, ScanFilter, bleuuid::BleUuid,
+};
 use btleplug::platform::{Adapter, Manager};
 use futures::stream::StreamExt;
-use std::error::Error;
 
 async fn get_central(manager: &Manager) -> Adapter {
     let adapters = manager.adapters().await.unwrap();
@@ -12,7 +13,7 @@ async fn get_central(manager: &Manager) -> Adapter {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
 
     let manager = Manager::new().await?;
@@ -20,6 +21,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // get the first bluetooth adapter
     // connect to the adapter
     let central = get_central(&manager).await;
+
+    let central_state = central.adapter_state().await.unwrap();
+    println!("CentralState: {:?}", central_state);
 
     // Each adapter has an event stream, we fetch via events(),
     // simplifying the type, this will return what is essentially a
@@ -35,7 +39,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     while let Some(event) = events.next().await {
         match event {
             CentralEvent::DeviceDiscovered(id) => {
-                println!("DeviceDiscovered: {:?}", id);
+                let peripheral = central.peripheral(&id).await?;
+                let properties = peripheral.properties().await?;
+                let name = properties
+                    .and_then(|p| p.local_name)
+                    .map(|local_name| format!("Name: {local_name}"))
+                    .unwrap_or_default();
+                println!("DeviceDiscovered: {:?} {}", id, name);
+            }
+            CentralEvent::StateUpdate(state) => {
+                println!("AdapterStatusUpdate {:?}", state);
             }
             CentralEvent::DeviceConnected(id) => {
                 println!("DeviceConnected: {:?}", id);

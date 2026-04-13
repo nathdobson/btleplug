@@ -76,6 +76,12 @@ impl From<[u8; 6]> for BDAddr {
     }
 }
 
+impl From<BDAddr> for [u8; 6] {
+    fn from(value: BDAddr) -> Self {
+        value.address
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for BDAddr {
     type Error = ParseBDAddrError;
 
@@ -106,7 +112,7 @@ impl TryFrom<u64> for BDAddr {
 impl From<BDAddr> for u64 {
     fn from(addr: BDAddr) -> Self {
         let mut slice = [0; 8];
-        (&mut slice[2..]).copy_from_slice(&addr.into_inner());
+        slice[2..].copy_from_slice(&addr.into_inner());
         u64::from_be_bytes(slice)
     }
 }
@@ -265,12 +271,11 @@ pub mod serde {
         where
             D: Deserializer<'de>,
         {
-            let buf = d.deserialize_str(ColonDelimVisitor)?;
-            BDAddr::from_str_delim(buf).map_err(D::Error::custom)
+            d.deserialize_str(ColonDelimVisitor)
         }
 
         impl<'de> Visitor<'de> for ColonDelimVisitor {
-            type Value = &'de str;
+            type Value = BDAddr;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 write!(
@@ -279,11 +284,25 @@ pub mod serde {
                 )
             }
 
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                BDAddr::from_str_delim(v).map_err(E::custom)
+            }
+
             fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
             where
                 E: DeError,
             {
-                Ok(v)
+                BDAddr::from_str_delim(v).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                BDAddr::from_str_delim(&v).map_err(E::custom)
             }
         }
     }
@@ -328,12 +347,11 @@ pub mod serde {
         where
             D: Deserializer<'de>,
         {
-            let buf = d.deserialize_str(NoDelimVisitor)?;
-            BDAddr::from_str_no_delim(buf).map_err(D::Error::custom)
+            d.deserialize_str(NoDelimVisitor)
         }
 
         impl<'de> Visitor<'de> for NoDelimVisitor {
-            type Value = &'de str;
+            type Value = BDAddr;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 write!(
@@ -342,11 +360,25 @@ pub mod serde {
                 )
             }
 
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                BDAddr::from_str_no_delim(v).map_err(E::custom)
+            }
+
             fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
             where
                 E: DeError,
             {
-                Ok(v)
+                BDAddr::from_str_no_delim(v).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                BDAddr::from_str_no_delim(&v).map_err(E::custom)
             }
         }
     }
@@ -451,5 +483,48 @@ mod tests {
 
         let addr_back: BDAddr = addr_as_hex.try_into().unwrap();
         assert_eq!(ADDR, addr_back);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_toml_delim_bdaddr_with_struct() {
+        use serde_cr::Deserialize;
+
+        #[derive(Deserialize, PartialEq, Copy, Clone, Debug)]
+        #[serde(crate = "serde_cr")]
+        struct Data {
+            addr: BDAddr,
+        }
+
+        let data = Data {
+            addr: BDAddr::from([0xff, 0x00, 0xff, 0x00, 0xff, 0x00]),
+        };
+
+        assert_eq!(toml::from_str(r#"addr = "ff:00:ff:00:ff:00""#), Ok(data));
+        assert!(
+            matches!(toml::from_str::<Data>(r"addr = 0"), Err(e) if e.message().contains("A colon seperated Bluetooth address, like `00:11:22:33:44:55`"))
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_toml_nodelim_bdaddr_with_struct() {
+        use serde_cr::Deserialize;
+
+        #[derive(Deserialize, PartialEq, Copy, Clone, Debug)]
+        #[serde(crate = "serde_cr")]
+        struct Data {
+            #[serde(with = "crate::serde::bdaddr::no_delim")]
+            addr: BDAddr,
+        }
+
+        let data = Data {
+            addr: BDAddr::from([0xff, 0x00, 0xff, 0x00, 0xff, 0x00]),
+        };
+
+        assert_eq!(toml::from_str(r#"addr = "ff00ff00ff00""#), Ok(data));
+        assert!(
+            matches!(toml::from_str::<Data>(r"addr = 0"), Err(e) if e.message().contains("A Bluetooth address without any delimiters, like `001122334455`")),
+        );
     }
 }

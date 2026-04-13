@@ -22,7 +22,7 @@
 //! ```rust,no_run
 //! use btleplug::api::{bleuuid::uuid_from_u16, Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 //! use btleplug::platform::{Adapter, Manager, Peripheral};
-//! use rand::{Rng, thread_rng};
+//! use rand::{RngExt, rng};
 //! use std::error::Error;
 //! use std::thread;
 //! use std::time::Duration;
@@ -59,9 +59,9 @@
 //!     let cmd_char = chars.iter().find(|c| c.uuid == LIGHT_CHARACTERISTIC_UUID).unwrap();
 //!
 //!     // dance party
-//!     let mut rng = thread_rng();
+//!     let mut rng = rng();
 //!     for _ in 0..20 {
-//!         let color_cmd = vec![0x56, rng.gen(), rng.gen(), rng.gen(), 0x00, 0xF0, 0xAA];
+//!         let color_cmd = vec![0x56, rng.random(), rng.random(), rng.random(), 0x00, 0xF0, 0xAA];
 //!         light.write(&cmd_char, &color_cmd, WriteType::WithoutResponse).await?;
 //!         time::sleep(Duration::from_millis(200)).await;
 //!     }
@@ -85,12 +85,6 @@
 //! }
 //! ```
 
-// We won't actually use anything specifically out of this crate. However, if we
-// want the CoreBluetooth code to compile, we need the objc protocols
-// (specifically, the core bluetooth protocols) exposed by it.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-extern crate cocoa;
-
 use crate::api::ParseBDAddrError;
 use std::result;
 use std::time::Duration;
@@ -100,8 +94,14 @@ pub mod api;
 mod bluez;
 #[cfg(not(target_os = "linux"))]
 mod common;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_vendor = "apple")]
 mod corebluetooth;
+#[cfg(target_os = "android")]
+mod droidplug;
+#[cfg(all(not(target_os = "android"), feature = "jni-host-tests"))]
+mod droidplug {
+    mod jni_utils;
+}
 pub mod platform;
 #[cfg(feature = "serde")]
 pub mod serde;
@@ -122,6 +122,18 @@ pub enum Error {
     #[error("Not connected")]
     NotConnected,
 
+    #[error("Unexpected callback")]
+    UnexpectedCallback,
+
+    #[error("Unexpected characteristic")]
+    UnexpectedCharacteristic,
+
+    #[error("No such characteristic")]
+    NoSuchCharacteristic,
+
+    #[error("No Bluetooth adapter available")]
+    NoAdapterAvailable,
+
     #[error("The operation is not supported: {}", _0)]
     NotSupported(String),
 
@@ -137,8 +149,18 @@ pub enum Error {
     #[error("JavaScript {:?}", _0)]
     JavaScript(String),
 
+    #[error("Runtime Error: {}", _0)]
+    RuntimeError(String),
+
     #[error("{}", _0)]
     Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Convert [`PoisonError`] to [`Error`] for replace `unwrap` to `map_err`
+impl<T: std::fmt::Debug> From<std::sync::PoisonError<T>> for Error {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        Self::Other(format!("{:?}", e).into())
+    }
 }
 
 /// Convenience type for a result using the btleplug [`Error`] type.

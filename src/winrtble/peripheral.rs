@@ -12,22 +12,23 @@
 // Copyright (c) 2014 The Rust Project Developers
 
 use super::{
-    advertisement_data_type, ble::characteristic::BLECharacteristic, ble::device::BLEDevice,
-    ble::service::BLEService, utils,
+    advertisement_data_type, ble::characteristic::BLECharacteristic,
+    ble::descriptor::BLEDescriptor, ble::device::BLEDevice, ble::service::BLEService, utils,
 };
 use crate::{
+    Error, Result,
     api::{
+        self, AddressType, BDAddr, CentralEvent, Characteristic, ConnectionParameterPreset,
+        ConnectionParameters, Descriptor, Peripheral as ApiPeripheral, PeripheralProperties,
+        Service, ValueNotification, WriteType,
         bleuuid::{uuid_from_u16, uuid_from_u32},
-        AddressType, BDAddr, CentralEvent, Characteristic, Peripheral as ApiPeripheral,
-        PeripheralProperties, Service, ValueNotification, WriteType,
     },
     common::{adapter_manager::AdapterManager, util::notifications_stream_from_broadcast_receiver},
-    Error, Result,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::stream::Stream;
-use log::{error, trace};
+use log::{trace, warn};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
@@ -37,14 +38,16 @@ use std::{
     convert::TryInto,
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU16, Ordering},
     sync::{Arc, RwLock},
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use std::sync::Weak;
+use windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic;
 use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType};
+use windows::core::GUID;
 
 #[cfg_attr(
     feature = "serde",
@@ -53,6 +56,12 @@ use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType};
 )]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PeripheralId(BDAddr);
+
+impl Display for PeripheralId {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
 
 /// Implementation of [api::Peripheral](crate::api::Peripheral).
 #[derive(Clone)]
@@ -64,6 +73,7 @@ struct Shared {
     device: tokio::sync::Mutex<Option<BLEDevice>>,
     adapter: Weak<AdapterManager<Peripheral>>,
     address: BDAddr,
+    mtu: AtomicU16,
     connected: AtomicBool,
     ble_services: DashMap<Uuid, BLEService>,
     notifications_channel: broadcast::Sender<ValueNotification>,
@@ -71,11 +81,13 @@ struct Shared {
     // Mutable, advertised, state...
     address_type: RwLock<Option<AddressType>>,
     local_name: RwLock<Option<String>>,
+    advertisement_name: RwLock<Option<String>>,
     last_tx_power_level: RwLock<Option<i16>>, // XXX: would be nice to avoid lock here!
     last_rssi: RwLock<Option<i16>>,           // XXX: would be nice to avoid lock here!
     latest_manufacturer_data: RwLock<HashMap<u16, Vec<u8>>>,
     latest_service_data: RwLock<HashMap<Uuid, Vec<u8>>>,
     services: RwLock<HashSet<Uuid>>,
+    class: RwLock<Option<u32>>,
 }
 
 impl Peripheral {
@@ -83,19 +95,22 @@ impl Peripheral {
         let (broadcast_sender, _) = broadcast::channel(16);
         Peripheral {
             shared: Arc::new(Shared {
-                adapter: adapter,
+                adapter,
                 device: tokio::sync::Mutex::new(None),
-                address: address,
+                address,
+                mtu: AtomicU16::new(api::DEFAULT_MTU_SIZE),
                 connected: AtomicBool::new(false),
                 ble_services: DashMap::new(),
                 notifications_channel: broadcast_sender,
                 address_type: RwLock::new(None),
                 local_name: RwLock::new(None),
+                advertisement_name: RwLock::new(None),
                 last_tx_power_level: RwLock::new(None),
                 last_rssi: RwLock::new(None),
                 latest_manufacturer_data: RwLock::new(HashMap::new()),
                 latest_service_data: RwLock::new(HashMap::new()),
                 services: RwLock::new(HashSet::new()),
+                class: RwLock::new(None),
             }),
         }
     }
@@ -107,6 +122,7 @@ impl Peripheral {
             address: self.address(),
             address_type: *self.shared.address_type.read().unwrap(),
             local_name: self.shared.local_name.read().unwrap().clone(),
+            advertisement_name: self.shared.advertisement_name.read().unwrap().clone(),
             tx_power_level: *self.shared.last_tx_power_level.read().unwrap(),
             rssi: *self.shared.last_rssi.read().unwrap(),
             manufacturer_data: self.shared.latest_manufacturer_data.read().unwrap().clone(),
@@ -117,8 +133,9 @@ impl Peripheral {
                 .read()
                 .unwrap()
                 .iter()
-                .map(|uuid| *uuid)
+                .copied()
                 .collect(),
+            class: *self.shared.class.read().unwrap(),
         }
     }
 
@@ -128,32 +145,39 @@ impl Peripheral {
         // Advertisements are cumulative: set/replace data only if it's set
         if let Ok(name) = advertisement.LocalName() {
             if !name.is_empty() {
-                // XXX: we could probably also assume that we've seen the
-                // advertisement before and speculatively take a read lock
-                // to confirm that the name hasn't changed...
-
-                let mut local_name_guard = self.shared.local_name.write().unwrap();
-                *local_name_guard = Some(name.to_string());
+                let name_str = name.to_string();
+                let mut adv_name_guard = self.shared.advertisement_name.write().unwrap();
+                *adv_name_guard = Some(name_str.clone());
+                drop(adv_name_guard);
+                // Also use as local_name fallback if we don't have one yet
+                let local_name_guard = self.shared.local_name.read().unwrap();
+                if local_name_guard.is_none() {
+                    drop(local_name_guard);
+                    let mut local_name_guard = self.shared.local_name.write().unwrap();
+                    *local_name_guard = Some(name_str);
+                }
             }
         }
         if let Ok(manufacturer_data) = advertisement.ManufacturerData() {
-            let mut manufacturer_data_guard = self.shared.latest_manufacturer_data.write().unwrap();
+            if manufacturer_data.Size().unwrap() > 0 {
+                let mut manufacturer_data_guard =
+                    self.shared.latest_manufacturer_data.write().unwrap();
+                *manufacturer_data_guard = manufacturer_data
+                    .into_iter()
+                    .map(|d| {
+                        let manufacturer_id = d.CompanyId().unwrap();
+                        let data = utils::to_vec(&d.Data().unwrap());
 
-            *manufacturer_data_guard = manufacturer_data
-                .into_iter()
-                .map(|d| {
-                    let manufacturer_id = d.CompanyId().unwrap();
-                    let data = utils::to_vec(&d.Data().unwrap());
+                        (manufacturer_id, data)
+                    })
+                    .collect();
 
-                    (manufacturer_id, data)
-                })
-                .collect();
-
-            // Emit event of newly received advertisement
-            self.emit_event(CentralEvent::ManufacturerDataAdvertisement {
-                id: self.shared.address.into(),
-                manufacturer_data: manufacturer_data_guard.clone(),
-            });
+                // Emit event of newly received advertisement
+                self.emit_event(CentralEvent::ManufacturerDataAdvertisement {
+                    id: self.shared.address.into(),
+                    manufacturer_data: manufacturer_data_guard.clone(),
+                });
+            }
         }
 
         // The Windows Runtime API (as of 19041) does not directly expose Service Data as a friendly API (like Manufacturer Data above)
@@ -242,7 +266,7 @@ impl Peripheral {
 
                 self.emit_event(CentralEvent::ServicesAdvertisement {
                     id: self.shared.address.into(),
-                    services: services_guard.iter().map(|uuid| *uuid).collect(),
+                    services: services_guard.iter().copied().collect(),
                 });
             }
         }
@@ -268,7 +292,16 @@ impl Peripheral {
         }
         if let Ok(rssi) = args.RawSignalStrengthInDBm() {
             let mut rssi_guard = self.shared.last_rssi.write().unwrap();
+            let old_rssi = *rssi_guard;
             *rssi_guard = Some(rssi);
+            drop(rssi_guard);
+            // Emit RssiUpdate event when RSSI changes
+            if old_rssi != Some(rssi) {
+                self.emit_event(CentralEvent::RssiUpdate {
+                    id: self.shared.address.into(),
+                    rssi,
+                });
+            }
         }
     }
 
@@ -330,6 +363,11 @@ impl ApiPeripheral for Peripheral {
         self.shared.address
     }
 
+    /// Returns the currently negotiated mtu size
+    fn mtu(&self) -> u16 {
+        self.shared.mtu.load(Ordering::Relaxed)
+    }
+
     /// Returns the set of properties associated with the peripheral. These may be updated over time
     /// as additional advertising reports are received.
     async fn properties(&self) -> Result<Option<PeripheralProperties>> {
@@ -353,12 +391,12 @@ impl ApiPeripheral for Peripheral {
     /// Ok there has been successful connection. Note that peripherals allow only one connection at
     /// a time. Operations that attempt to communicate with a device will fail until it is connected.
     async fn connect(&self) -> Result<()> {
-        let shared_clone = Arc::downgrade(&self.shared);
         let adapter_clone = self.shared.adapter.clone();
         let address = self.shared.address;
-        let device = BLEDevice::new(
-            self.shared.address,
-            Box::new(move |is_connected| {
+
+        let connection_status_changed = Box::new({
+            let shared_clone = Arc::downgrade(&self.shared);
+            move |is_connected| {
                 if let Some(shared) = shared_clone.upgrade() {
                     shared.connected.store(is_connected, Ordering::Relaxed);
                 }
@@ -368,11 +406,34 @@ impl ApiPeripheral for Peripheral {
                         adapter.emit(CentralEvent::DeviceDisconnected(address.into()));
                     }
                 }
-            }),
+            }
+        });
+
+        let max_pdu_size_changed = Box::new({
+            let shared_clone = Arc::downgrade(&self.shared);
+            move |mtu| {
+                if let Some(shared) = shared_clone.upgrade() {
+                    shared.mtu.store(mtu, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let device = BLEDevice::new(
+            self.shared.address,
+            connection_status_changed,
+            max_pdu_size_changed,
         )
         .await?;
 
         device.connect().await?;
+        // Query the system-cached device name (GAP name) and update local_name
+        if let Ok(name) = device.name() {
+            let name_str = name.to_string();
+            if !name_str.is_empty() {
+                let mut local_name_guard = self.shared.local_name.write().unwrap();
+                *local_name_guard = Some(name_str);
+            }
+        }
         let mut d = self.shared.device.lock().await;
         *d = Some(device);
         self.shared.connected.store(true, Ordering::Relaxed);
@@ -382,27 +443,63 @@ impl ApiPeripheral for Peripheral {
 
     /// Terminates a connection to the device. This is a synchronous operation.
     async fn disconnect(&self) -> Result<()> {
+        // We need to clear the services because if this device is re-connected,
+        // the cached service objects will no longer be valid (they must be refreshed).
+        self.shared.ble_services.clear();
         let mut device = self.shared.device.lock().await;
         *device = None;
+        self.shared.connected.store(false, Ordering::Relaxed);
         self.emit_event(CentralEvent::DeviceDisconnected(self.shared.address.into()));
         Ok(())
     }
 
     /// Discovers all characteristics for the device. This is a synchronous operation.
     async fn discover_services(&self) -> Result<()> {
-        let device = self.shared.device.lock().await;
-        if let Some(ref device) = *device {
+        let mut device = self.shared.device.lock().await;
+        if let Some(ref mut device) = *device {
             let gatt_services = device.discover_services().await?;
-            for service in &gatt_services {
+            for service in gatt_services {
                 let uuid = utils::to_uuid(&service.Uuid().unwrap());
                 if !self.shared.ble_services.contains_key(&uuid) {
-                    match BLEDevice::get_characteristics(&service).await {
+                    match BLEDevice::get_characteristics(service).await {
                         Ok(characteristics) => {
                             let characteristics = characteristics
                                 .into_iter()
-                                .map(|gatt_characteristic| {
+                                .fold(
+                                    // Only consider the first characteristic of each UUID
+                                    // This "should" be unique, but of course it's not enforced
+                                    HashMap::<GUID, GattCharacteristic>::new(),
+                                    |mut map, gatt_characteristic| {
+                                        let uuid = gatt_characteristic.Uuid().unwrap_or_default();
+                                        if !map.contains_key(&uuid) {
+                                            map.insert(uuid, gatt_characteristic);
+                                        }
+                                        map
+                                    },
+                                )
+                                .into_iter()
+                                .map(|(_, characteristic)| async {
+                                    let c = characteristic.clone();
+                                    (
+                                        characteristic,
+                                        BLEDevice::get_characteristic_descriptors(&c)
+                                            .await
+                                            .unwrap_or(Vec::new())
+                                            .into_iter()
+                                            .map(|descriptor| {
+                                                let descriptor = BLEDescriptor::new(descriptor);
+                                                (descriptor.uuid(), descriptor)
+                                            })
+                                            .collect(),
+                                    )
+                                });
+
+                            let characteristics = futures::future::join_all(characteristics)
+                                .await
+                                .into_iter()
+                                .map(|(characteristic, descriptors)| {
                                     let characteristic =
-                                        BLECharacteristic::new(gatt_characteristic);
+                                        BLECharacteristic::new(characteristic, descriptors);
                                     (characteristic.uuid(), characteristic)
                                 })
                                 .collect();
@@ -416,7 +513,7 @@ impl ApiPeripheral for Peripheral {
                             );
                         }
                         Err(e) => {
-                            error!("get_characteristics_async {:?}", e);
+                            warn!("get_characteristics_async {:?}", e);
                         }
                     }
                 }
@@ -460,9 +557,14 @@ impl ApiPeripheral for Peripheral {
             .ok_or_else(|| Error::NotSupported("Characteristic not found for subscribe".into()))?;
         let notifications_sender = self.shared.notifications_channel.clone();
         let uuid = characteristic.uuid;
+        let service_uuid = characteristic.service_uuid;
         ble_characteristic
             .subscribe(Box::new(move |value| {
-                let notification = ValueNotification { uuid: uuid, value };
+                let notification = ValueNotification {
+                    uuid,
+                    service_uuid,
+                    value,
+                };
                 // Note: we ignore send errors here which may happen while there are no
                 // receivers...
                 let _ = notifications_sender.send(notification);
@@ -503,6 +605,64 @@ impl ApiPeripheral for Peripheral {
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         let receiver = self.shared.notifications_channel.subscribe();
         Ok(notifications_stream_from_broadcast_receiver(receiver))
+    }
+
+    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
+        let ble_service = &*self
+            .shared
+            .ble_services
+            .get(&descriptor.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for write".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get(&descriptor.characteristic_uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for write".into()))?;
+        let ble_descriptor = ble_characteristic
+            .descriptors
+            .get(&descriptor.uuid)
+            .ok_or_else(|| Error::NotSupported("Descriptor not found for write".into()))?;
+        ble_descriptor.write_value(data).await
+    }
+
+    async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        let ble_service = &*self
+            .shared
+            .ble_services
+            .get(&descriptor.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for read".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get(&descriptor.characteristic_uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for read".into()))?;
+        let ble_descriptor = ble_characteristic
+            .descriptors
+            .get(&descriptor.uuid)
+            .ok_or_else(|| Error::NotSupported("Descriptor not found for write".into()))?;
+        ble_descriptor.read_value().await
+    }
+
+    async fn read_rssi(&self) -> Result<i16> {
+        self.shared
+            .last_rssi
+            .read()
+            .unwrap()
+            .ok_or(Error::NotConnected)
+    }
+
+    async fn connection_parameters(&self) -> Result<Option<ConnectionParameters>> {
+        let device = self.shared.device.lock().await;
+        match &*device {
+            Some(device) => Ok(Some(device.get_connection_parameters()?)),
+            None => Err(Error::NotConnected),
+        }
+    }
+
+    async fn request_connection_parameters(&self, preset: ConnectionParameterPreset) -> Result<()> {
+        let device = self.shared.device.lock().await;
+        match &*device {
+            Some(device) => device.request_connection_parameters(preset),
+            None => Err(Error::NotConnected),
+        }
     }
 }
 

@@ -1,6 +1,9 @@
-use super::internal::{run_corebluetooth_thread, CoreBluetoothEvent, CoreBluetoothMessage};
+use super::internal::{
+    CoreBluetoothEvent, CoreBluetoothMessage, CoreBluetoothReply, CoreBluetoothReplyFuture,
+    run_corebluetooth_thread,
+};
 use super::peripheral::{Peripheral, PeripheralId};
-use crate::api::{BDAddr, Central, CentralEvent, ScanFilter};
+use crate::api::{Central, CentralEvent, CentralState, ScanFilter};
 use crate::common::adapter_manager::AdapterManager;
 use crate::{Error, Result};
 use async_trait::async_trait;
@@ -8,6 +11,7 @@ use futures::channel::mpsc::{self, Sender};
 use futures::sink::SinkExt;
 use futures::stream::{Stream, StreamExt};
 use log::*;
+use objc2_core_bluetooth::CBManagerState;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task;
@@ -17,6 +21,14 @@ use tokio::task;
 pub struct Adapter {
     manager: Arc<AdapterManager<Peripheral>>,
     sender: Sender<CoreBluetoothMessage>,
+}
+
+fn get_central_state(state: CBManagerState) -> CentralState {
+    match state {
+        CBManagerState::PoweredOn => CentralState::PoweredOn,
+        CBManagerState::PoweredOff => CentralState::PoweredOff,
+        _ => CentralState::Unknown,
+    }
 }
 
 impl Adapter {
@@ -29,7 +41,7 @@ impl Adapter {
         debug!("Waiting on adapter connect");
         if !matches!(
             receiver.next().await,
-            Some(CoreBluetoothEvent::AdapterConnected)
+            Some(CoreBluetoothEvent::DidUpdateState { state: _ })
         ) {
             return Err(Error::Other(
                 "Adapter failed to connect.".to_string().into(),
@@ -45,29 +57,38 @@ impl Adapter {
                 match msg {
                     CoreBluetoothEvent::DeviceDiscovered {
                         uuid,
-                        name,
+                        local_name,
+                        advertisement_name,
                         event_receiver,
                     } => {
                         manager_clone.add_peripheral(Peripheral::new(
                             uuid,
-                            name,
+                            local_name,
+                            advertisement_name,
                             Arc::downgrade(&manager_clone),
                             event_receiver,
                             adapter_sender_clone.clone(),
                         ));
                         manager_clone.emit(CentralEvent::DeviceDiscovered(uuid.into()));
                     }
-                    CoreBluetoothEvent::DeviceUpdated { uuid, name } => {
+                    CoreBluetoothEvent::DeviceUpdated {
+                        uuid,
+                        local_name,
+                        advertisement_name,
+                    } => {
                         let id = uuid.into();
                         if let Some(entry) = manager_clone.peripheral_mut(&id) {
-                            entry.value().update_name(&name);
+                            entry.value().update_name(local_name, advertisement_name);
                             manager_clone.emit(CentralEvent::DeviceUpdated(id));
                         }
                     }
                     CoreBluetoothEvent::DeviceDisconnected { uuid } => {
                         manager_clone.emit(CentralEvent::DeviceDisconnected(uuid.into()));
                     }
-                    _ => {}
+                    CoreBluetoothEvent::DidUpdateState { state } => {
+                        let central_state = get_central_state(state);
+                        manager_clone.emit(CentralEvent::StateUpdate(central_state));
+                    }
                 }
             }
         });
@@ -111,14 +132,37 @@ impl Central for Adapter {
         self.manager.peripheral(id).ok_or(Error::DeviceNotFound)
     }
 
-    async fn add_peripheral(&self, _address: BDAddr) -> Result<Peripheral> {
+    async fn add_peripheral(&self, _address: &PeripheralId) -> Result<Peripheral> {
         Err(Error::NotSupported(
-            "Can't add a Peripheral from a BDAddr".to_string(),
+            "Can't add a Peripheral from a PeripheralId".to_string(),
         ))
+    }
+
+    async fn clear_peripherals(&self) -> Result<()> {
+        self.manager.clear_peripherals();
+        Ok(())
     }
 
     async fn adapter_info(&self) -> Result<String> {
         // TODO: Get information about the adapter.
         Ok("CoreBluetooth".to_string())
+    }
+
+    async fn adapter_state(&self) -> Result<CentralState> {
+        let fut = CoreBluetoothReplyFuture::default();
+        self.sender
+            .to_owned()
+            .send(CoreBluetoothMessage::GetAdapterState {
+                future: fut.get_state_clone(),
+            })
+            .await?;
+
+        match fut.await {
+            CoreBluetoothReply::AdapterState(state) => {
+                let central_state = get_central_state(state);
+                return Ok(central_state.clone());
+            }
+            _ => panic!("Shouldn't get anything but a AdapterState!"),
+        }
     }
 }

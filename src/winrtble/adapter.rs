@@ -13,9 +13,9 @@
 
 use super::{ble::watcher::BLEWatcher, peripheral::Peripheral, peripheral::PeripheralId};
 use crate::{
-    api::{BDAddr, Central, CentralEvent, ScanFilter},
-    common::adapter_manager::AdapterManager,
     Error, Result,
+    api::{BDAddr, Central, CentralEvent, CentralState, ScanFilter},
+    common::adapter_manager::AdapterManager,
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -23,19 +23,50 @@ use std::convert::TryInto;
 use std::fmt::{self, Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use windows::{
+    Devices::Radios::{Radio, RadioState},
+    Foundation::TypedEventHandler,
+};
 
 /// Implementation of [api::Central](crate::api::Central).
 #[derive(Clone)]
 pub struct Adapter {
     watcher: Arc<Mutex<BLEWatcher>>,
     manager: Arc<AdapterManager<Peripheral>>,
+    radio: Radio,
+}
+
+// https://github.com/microsoft/windows-rs/blob/master/crates/libs/windows/src/Windows/Devices/Radios/mod.rs
+fn get_central_state(radio: &Radio) -> CentralState {
+    let state = radio.State().unwrap_or(RadioState::Unknown);
+    match state {
+        RadioState::On => CentralState::PoweredOn,
+        RadioState::Off => CentralState::PoweredOff,
+        _ => CentralState::Unknown,
+    }
 }
 
 impl Adapter {
-    pub(crate) fn new() -> Self {
-        let watcher = Arc::new(Mutex::new(BLEWatcher::new()));
+    pub(crate) fn new(radio: Radio) -> Result<Self> {
+        let watcher = Arc::new(Mutex::new(BLEWatcher::new()?));
         let manager = Arc::new(AdapterManager::default());
-        Adapter { watcher, manager }
+
+        let radio_clone = radio.clone();
+        let manager_clone = manager.clone();
+        let handler = TypedEventHandler::new(move |_sender, _args| {
+            let state = get_central_state(&radio_clone);
+            manager_clone.emit(CentralEvent::StateUpdate(state.into()));
+            Ok(())
+        });
+        if let Err(err) = radio.StateChanged(&handler) {
+            eprintln!("radio.StateChanged error: {}", err);
+        }
+
+        Ok(Adapter {
+            watcher,
+            manager,
+            radio,
+        })
     }
 }
 
@@ -55,28 +86,31 @@ impl Central for Adapter {
         Ok(self.manager.event_stream())
     }
 
-    async fn start_scan(&self, _filter: ScanFilter) -> Result<()> {
-        // TODO: implement filter
-        let watcher = self.watcher.lock().unwrap();
+    async fn start_scan(&self, filter: ScanFilter) -> Result<()> {
+        let watcher = self.watcher.lock().map_err(Into::<Error>::into)?;
         let manager = self.manager.clone();
-        watcher.start(Box::new(move |args| {
-            let bluetooth_address = args.BluetoothAddress().unwrap();
-            let address: BDAddr = bluetooth_address.try_into().unwrap();
-            if let Some(mut entry) = manager.peripheral_mut(&address.into()) {
-                entry.value_mut().update_properties(args);
-                manager.emit(CentralEvent::DeviceUpdated(address.into()));
-            } else {
-                let peripheral = Peripheral::new(Arc::downgrade(&manager), address);
-                peripheral.update_properties(args);
-                manager.add_peripheral(peripheral);
-                manager.emit(CentralEvent::DeviceDiscovered(address.into()));
-            }
-        }))
+        watcher.start(
+            filter,
+            Box::new(move |args| {
+                let bluetooth_address = args.BluetoothAddress()?;
+                let address: BDAddr = bluetooth_address.try_into().unwrap();
+                if let Some(mut entry) = manager.peripheral_mut(&address.into()) {
+                    entry.value_mut().update_properties(args);
+                    manager.emit(CentralEvent::DeviceUpdated(address.into()));
+                } else {
+                    let peripheral = Peripheral::new(Arc::downgrade(&manager), address);
+                    peripheral.update_properties(args);
+                    manager.add_peripheral(peripheral);
+                    manager.emit(CentralEvent::DeviceDiscovered(address.into()));
+                }
+                Ok(())
+            }),
+        )
     }
 
     async fn stop_scan(&self) -> Result<()> {
-        let watcher = self.watcher.lock().unwrap();
-        watcher.stop().unwrap();
+        let watcher = self.watcher.lock().map_err(Into::<Error>::into)?;
+        watcher.stop()?;
         Ok(())
     }
 
@@ -88,14 +122,23 @@ impl Central for Adapter {
         self.manager.peripheral(id).ok_or(Error::DeviceNotFound)
     }
 
-    async fn add_peripheral(&self, _address: BDAddr) -> Result<Peripheral> {
+    async fn add_peripheral(&self, _address: &PeripheralId) -> Result<Peripheral> {
         Err(Error::NotSupported(
             "Can't add a Peripheral from a BDAddr".to_string(),
         ))
     }
 
+    async fn clear_peripherals(&self) -> Result<()> {
+        self.manager.clear_peripherals();
+        Ok(())
+    }
+
     async fn adapter_info(&self) -> Result<String> {
         // TODO: Get information about the adapter.
         Ok("WinRT".to_string())
+    }
+
+    async fn adapter_state(&self) -> Result<CentralState> {
+        Ok(get_central_state(&self.radio))
     }
 }

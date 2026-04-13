@@ -12,8 +12,9 @@
 // Copyright (c) 2014 The Rust Project Developers
 
 use super::adapter::Adapter;
-use crate::{api, Result};
+use crate::{Result, api};
 use async_trait::async_trait;
+use std::future::IntoFuture;
 use windows::Devices::Radios::{Radio, RadioKind};
 
 /// Implementation of [api::Manager](crate::api::Manager).
@@ -31,15 +32,11 @@ impl api::Manager for Manager {
     type Adapter = Adapter;
 
     async fn adapters(&self) -> Result<Vec<Adapter>> {
-        let mut result: Vec<Adapter> = vec![];
-        let radios = Radio::GetRadiosAsync().unwrap().await.unwrap();
-
-        for radio in &radios {
-            let kind = radio.Kind().unwrap();
-            if kind == RadioKind::Bluetooth {
-                result.push(Adapter::new());
-            }
-        }
-        return Ok(result);
+        let radios = Radio::GetRadiosAsync()?.into_future().await?;
+        radios
+            .into_iter()
+            .filter(|radio| radio.Kind() == Ok(RadioKind::Bluetooth))
+            .map(|radio| Adapter::new(radio))
+            .collect()
     }
 }

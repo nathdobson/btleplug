@@ -1,3 +1,195 @@
+# 0.12.0 (2026-03-08)
+
+## Features
+
+- Add `mtu()` method to `Peripheral` trait (returns negotiated MTU)
+- Add `connect_with_timeout()` and `discover_services_with_timeout()` convenience methods
+- Add `read_rssi()` to `Peripheral` trait (supported on all platforms)
+- Add `connection_parameters()` and `request_connection_parameters()` to `Peripheral` trait (Windows/Android)
+- Add `ConnectionParameters` and `ConnectionParameterPreset` types
+- Add `clear_peripherals()` to `Central` trait
+  - Thanks danielstuart14!
+- Add `adapter_state()` to `Central` trait for querying Bluetooth on/off state
+- Add `add_peripheral()` to `Central` trait for adding a device by address without scanning (Android)
+- Add `advertisement_name` field to `PeripheralProperties`
+  - Thanks szymonlesisz!
+- Add `service_uuid` field to `ValueNotification`
+  - Thanks MnlPhlp!
+- Add `CentralEvent::RssiUpdate` for RSSI change events
+- Add `CentralEvent::DeviceServicesModified` (CoreBluetooth only)
+  - Thanks kragacles!
+- Add `Error::NoAdapterAvailable` variant
+- Add `DEFAULT_MTU_SIZE` constant
+- Add `From<BDAddr> for [u8; 6]` conversion
+  - Thanks gabevenberg!
+- Add `./scripts/build-java.sh` for building the Android Java components
+- Add integration test suite with Zephyr and Bumble test peripherals
+- Vendor jni-utils-rs Java classes directly into the btleplug source tree (no longer a separate Maven dependency)
+
+## Bugfixes
+
+- Fix CoreBluetooth peripheral name handling
+  - Thanks szymonlesisz!
+- Fix BlueZ device disconnection (#446)
+  - Thanks szymonlesisz!
+- Improve CoreBluetooth didModifyServices handling and comments
+  - Thanks kragacles!
+- Add NSError to CoreBluetooth trace logging
+  - Thanks tternes!
+
+## Breaking Changes
+
+- **`CentralEvent` enum**: New variants `DeviceServicesModified` and `RssiUpdate`. Exhaustive matches will need updating.
+- **`Error` enum**: New variant `NoAdapterAvailable`. Exhaustive matches will need updating.
+
+- Update dependencies
+
+# 0.11.8 (2025-04-20)
+
+## Features
+
+- Update dependencies
+  - Including to windows-rs 0.61, which required some small code changes
+
+# 0.11.7 (2024-12-21)
+
+## Features
+
+- Deserialize BDAddr from non-borrowed strings
+  - Thanks icewind1991, ekuinox!
+- Add support for Extended Advertising on Android
+  - Thanks Jakouf!
+
+## Bugfixes
+
+- Call GetDefaultAdapter() instead of GetAdapter() on Android
+- Use BluetoothCacheMode::Uncached for services fetching on windows
+  - This *may* cause issues with connection times, we'll see how it works out
+- Characteristics with duplicate UUIDs (but differing handles) no longer overwrite each other
+  - Thanks blackspherefollower!
+- CoreBluetooth now fulfills all open characteristic futures on disconnect
+  - Thanks szymonlesisz!
+
+# 0.11.6 (2024-10-06)
+
+## Features
+
+- Move from objc to objc2
+  - Now using an actually updated/maintained coreAPI library! Thanks madsmtm!
+- Implement CentralState for mac/linux/windows to tell when bluetooth is on/off
+  - Thanks szymonlesisz!
+  - Still needs Android impl.
+
+## Bugfixes
+
+- Make local_name on CoreBluetooth match that of Windows/Linux returns when possible.
+  - Thanks yuyoyuppe!
+- Fix descriptor reading on CoreBluetooth
+  - Thanks kovapatrik!
+- Fix one of the many, many NullPointerException issues in droidplug
+  - Thanks blackspherefollower!
+  - There are so many more though, esp when we don't have correct permissions on Android.
+
+# 0.11.5 (2024-01-10)
+
+## Bugfixes
+
+- Fix issue with Windows failing to read characteristic descriptors
+
+# 0.11.4 (2024-01-01)
+
+## Bugfixes
+
+- Fix issue with manufacturer data not being consistently found on windows
+- Fix UUID used for finding characteristics on windows
+- Peripheral connection failure now returns an error
+- Peripheral service discovery failure now returns an error
+
+# 0.11.3 (2023-11-18)
+
+## Bugfixes
+
+- CoreBluetooth: Fix missing include
+
+# 0.11.2 (2023-11-18)
+
+## Bugfixes
+
+- Android: Fix advertisements with invalid UTF-8 strings not appearing
+- All Platforms: Fix clippy warnings
+
+# 0.11.1 (2023-09-08)
+
+## Bugfixes
+
+- Windows/UWP: Internally held BTLE services now automatically disconnect when device disconnect is
+  called.
+
+# 0.11.0 (2023-07-04)
+
+## Features
+
+- Add scan filtering for android and windows
+- Implement serde Serialize/Deserliaze for PeripheralProperties, ScannFilter (#310, #314)
+- Add device class to properties (#319)
+- Add descriptor discovery and read/write across all platforms (#316)
+
+## Bugfixes
+
+- Update RSSI w/ advertisements on CoreBluetooth (#306)
+- Fix issues with various unhandled exceptions on Android (#311)
+
+# 0.10.5 (2023-04-13)
+
+## Features
+
+- Add RSSI readings for Android
+
+## Bugfixes
+
+- Link conditionally against macOS AppKit based on platform
+- Improve error propagation on Windows
+- Reset connected state to false on disconnect on windows
+- Set DuplicateData = true for bluez
+
+# 0.10.4 (2022-11-27)
+
+## Bugfixes
+
+- Change common CoreBluetooth log message from error to info level
+
+# 0.10.3 (2022-11-05)
+
+## Bugfixes
+
+- Add PeripheralId Display implementation for Android PeripheralId
+
+# 0.10.2 (2022-10-30)
+
+## Features
+
+- Implement Display on PeripheralId
+
+## Bugfixes
+
+- Fix issues with panics on device disconnect on macOS
+
+# 0.10.1 (2022-09-23)
+
+## Features
+
+- Add ability to disconnect devices on macOS/iOS
+
+# 0.10.0 (2022-07-30)
+
+## Features
+
+- Add Android Support
+
+## Breaking Changes
+
+- Update to Uuid v1, which is incompatible with Uuid v0.x. This may cause issues in upgrades.
+
 # 0.9.2 (2022-03-05)
 
 ## Features

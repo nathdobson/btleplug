@@ -11,7 +11,7 @@
 //
 // Copyright (c) 2014 The Rust Project Developers
 
-use crate::{api::CharPropFlags, Error, Result};
+use crate::{Error, Result, api::CharPropFlags};
 use std::str::FromStr;
 use uuid::Uuid;
 use windows::core::GUID;
@@ -33,7 +33,7 @@ pub fn to_error(status: GattCommunicationStatus) -> Result<()> {
     } else if status == GattCommunicationStatus::ProtocolError {
         Err(Error::NotSupported("ProtocolError".to_string()))
     } else {
-        Err(Error::Other(format!("Communication Error:").into()))
+        Err(Error::Other("Communication Error:".to_string().into()))
     }
 }
 
@@ -116,14 +116,14 @@ mod tests {
 
         let guid_converted = to_guid(&uuid);
 
-        let guid_expected = GUID::from(uuid_str);
+        let guid_expected = GUID::try_from(uuid_str).unwrap();
         assert_eq!(guid_converted, guid_expected);
     }
 
     #[test]
     fn check_guid_to_uuid_conversion() {
         let uuid_str = "10B201FF-5B3B-45A1-9508-CF3EFCD7BBAF";
-        let guid = GUID::from(uuid_str);
+        let guid = GUID::try_from(uuid_str).unwrap();
 
         let uuid_converted = to_uuid(&guid);
 

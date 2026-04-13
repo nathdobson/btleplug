@@ -36,6 +36,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -43,24 +44,23 @@ pub use self::bdaddr::{BDAddr, ParseBDAddrError};
 
 use crate::platform::PeripheralId;
 
+/// The default MTU size for a peripheral.
+pub const DEFAULT_MTU_SIZE: u16 = 23;
+
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),
     serde(crate = "serde_cr")
 )]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum AddressType {
     Random,
+    #[default]
     Public,
 }
 
-impl Default for AddressType {
-    fn default() -> Self {
-        AddressType::Public
-    }
-}
-
 impl AddressType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(v: &str) -> Option<AddressType> {
         match v {
             "public" => Some(AddressType::Public),
@@ -90,12 +90,15 @@ impl AddressType {
 pub struct ValueNotification {
     /// UUID of the characteristic that fired the notification.
     pub uuid: Uuid,
+    /// UUID of the service that contains the characteristic.
+    pub service_uuid: Uuid,
     /// The new value of the characteristic.
     pub value: Vec<u8>,
 }
 
 bitflags! {
     /// A set of properties that indicate what operations are supported by a Characteristic.
+    #[derive(Default, Debug, PartialEq, Eq, Ord, PartialOrd, Clone, Copy)]
     pub struct CharPropFlags: u8 {
         const BROADCAST = 0x01;
         const READ = 0x02;
@@ -105,12 +108,6 @@ bitflags! {
         const INDICATE = 0x20;
         const AUTHENTICATED_SIGNED_WRITES = 0x40;
         const EXTENDED_PROPERTIES = 0x80;
-    }
-}
-
-impl Default for CharPropFlags {
-    fn default() -> Self {
-        Self { bits: 0 }
     }
 }
 
@@ -144,6 +141,8 @@ pub struct Characteristic {
     /// supports. If you attempt an operation that is not supported by the characteristics (for
     /// example setting notify on one without the NOTIFY flag), that operation will fail.
     pub properties: CharPropFlags,
+    /// The descriptors of this characteristic.
+    pub descriptors: BTreeSet<Descriptor>,
 }
 
 impl Display for Characteristic {
@@ -156,16 +155,40 @@ impl Display for Characteristic {
     }
 }
 
+/// Add doc
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Clone)]
+pub struct Descriptor {
+    /// The UUID for this descriptor. This uniquely identifies its behavior.
+    pub uuid: Uuid,
+    /// The UUID of the service this descriptor belongs to.
+    pub service_uuid: Uuid,
+    /// The UUID of the characteristic this descriptor belongs to.
+    pub characteristic_uuid: Uuid,
+}
+
+impl Display for Descriptor {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "uuid: {:?}", self.uuid)
+    }
+}
+
 /// The properties of this peripheral, as determined by the advertising reports we've received for
 /// it.
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
 #[derive(Debug, Default, Clone)]
 pub struct PeripheralProperties {
     /// The address of this peripheral
     pub address: BDAddr,
     /// The type of address (either random or public)
     pub address_type: Option<AddressType>,
-    /// The local name. This is generally a human-readable string that identifies the type of device.
+    /// The GAP local name. This is generally a human-readable string that identifies the type of device.
     pub local_name: Option<String>,
+    /// The advertisement name. May be different than local_name.
+    pub advertisement_name: Option<String>,
     /// The transmission power level for the device
     pub tx_power_level: Option<i16>,
     /// The most recent Received Signal Strength Indicator for the device
@@ -178,14 +201,42 @@ pub struct PeripheralProperties {
     pub service_data: HashMap<Uuid, Vec<u8>>,
     /// Advertised services for this device
     pub services: Vec<Uuid>,
+    pub class: Option<u32>,
 }
 
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
 /// The filter used when scanning for BLE devices.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanFilter {
     /// If the filter contains at least one service UUID, only devices supporting at least one of
     /// the given services will be available.
     pub services: Vec<Uuid>,
+}
+
+/// Current BLE connection parameters as reported by the OS.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConnectionParameters {
+    /// Connection interval in microseconds (typically 7_500..4_000_000).
+    pub interval_us: u32,
+    /// Slave latency in number of connection events (0..499).
+    pub latency: u16,
+    /// Supervision timeout in microseconds (100_000..32_000_000).
+    pub supervision_timeout_us: u32,
+}
+
+/// Preferred connection parameter presets for requesting updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionParameterPreset {
+    /// Balanced between throughput and power (default).
+    Balanced,
+    /// Low latency, high throughput. Use temporarily for bulk transfers.
+    ThroughputOptimized,
+    /// Reduced power consumption, higher latency.
+    PowerOptimized,
 }
 
 /// The type of write operation to use.
@@ -208,6 +259,9 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
 
     /// Returns the MAC address of the peripheral.
     fn address(&self) -> BDAddr;
+
+    /// Returns the currently negotiated mtu size
+    fn mtu(&self) -> u16;
 
     /// Returns the set of properties associated with the peripheral. These may be updated over time
     /// as additional advertising reports are received.
@@ -234,11 +288,28 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// attempt to communicate with a device will fail until it is connected.
     async fn connect(&self) -> Result<()>;
 
+    /// Like [`connect`](Peripheral::connect), but returns [`Error::TimedOut`](crate::Error::TimedOut)
+    /// if the connection is not established within the given duration.
+    async fn connect_with_timeout(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.connect())
+            .await
+            .map_err(|_| crate::Error::TimedOut(timeout))?
+    }
+
     /// Terminates a connection to the device.
     async fn disconnect(&self) -> Result<()>;
 
     /// Discovers all services for the device, including their characteristics.
     async fn discover_services(&self) -> Result<()>;
+
+    /// Like [`discover_services`](Peripheral::discover_services), but returns
+    /// [`Error::TimedOut`](crate::Error::TimedOut) if discovery does not complete within the
+    /// given duration.
+    async fn discover_services_with_timeout(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.discover_services())
+            .await
+            .map_err(|_| crate::Error::TimedOut(timeout))?
+    }
 
     /// Write some data to the characteristic. Returns an error if the write couldn't be sent or (in
     /// the case of a write-with-response) if the device returns an error.
@@ -264,6 +335,62 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// The stream will remain valid across connections and can be queried before any connection
     /// is made.
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>>;
+
+    /// Write some data to the descriptor. Returns an error if the write couldn't be sent or (in
+    /// the case of a write-with-response) if the device returns an error.
+    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()>;
+
+    /// Sends a read descriptor request to the device. Returns either an error if the request
+    /// was not accepted or the response from the device.
+    async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>>;
+
+    /// Returns current connection parameters, if available on this platform.
+    /// Returns `Ok(None)` if the platform doesn't support reading parameters.
+    /// Returns `Err` if not connected.
+    async fn connection_parameters(&self) -> Result<Option<ConnectionParameters>> {
+        Err(crate::Error::NotSupported(
+            "connection_parameters".to_string(),
+        ))
+    }
+
+    /// Request a connection parameter update using a preset.
+    /// This is a request — the remote device may accept or reject.
+    /// Returns `Err(NotSupported)` on platforms that don't support this.
+    async fn request_connection_parameters(
+        &self,
+        _preset: ConnectionParameterPreset,
+    ) -> Result<()> {
+        Err(crate::Error::NotSupported(
+            "request_connection_parameters".to_string(),
+        ))
+    }
+
+    /// Read the current RSSI (signal strength) for this peripheral, in dBm.
+    ///
+    /// Behavior varies by platform:
+    /// - **macOS/iOS/Android**: Actively reads RSSI from the connected device.
+    /// - **Linux**: Returns the latest RSSI from BlueZ device properties.
+    /// - **Windows**: Returns the most recent RSSI from advertisements
+    ///   (requires scanning to be active for fresh values).
+    ///
+    /// Returns `Err(NotConnected)` if not connected (except Windows, which may
+    /// return a cached scan value).
+    async fn read_rssi(&self) -> Result<i16> {
+        Err(crate::Error::NotSupported("read_rssi".to_string()))
+    }
+}
+
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+/// The state of the Central
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CentralState {
+    Unknown = 0,
+    PoweredOn = 1,
+    PoweredOff = 2,
 }
 
 #[cfg_attr(
@@ -277,6 +404,8 @@ pub enum CentralEvent {
     DeviceUpdated(PeripheralId),
     DeviceConnected(PeripheralId),
     DeviceDisconnected(PeripheralId),
+    /// Only emitted on the corebluetooth subsystem
+    DeviceServicesModified(PeripheralId),
     /// Emitted when a Manufacturer Data advertisement has been received from a device
     ManufacturerDataAdvertisement {
         id: PeripheralId,
@@ -292,6 +421,14 @@ pub enum CentralEvent {
         id: PeripheralId,
         services: Vec<Uuid>,
     },
+    /// Emitted when an RSSI (signal strength) update is received for a device.
+    /// This may come from advertisements during scanning, or from an active
+    /// `read_rssi()` call on connected platforms.
+    RssiUpdate {
+        id: PeripheralId,
+        rssi: i16,
+    },
+    StateUpdate(CentralState),
 }
 
 /// Central is the "client" of BLE. It's able to scan for and establish connections to peripherals.
@@ -324,13 +461,21 @@ pub trait Central: Send + Sync + Clone {
     async fn peripheral(&self, id: &PeripheralId) -> Result<Self::Peripheral>;
 
     /// Add a [`Peripheral`] from a MAC address without a scan result. Not supported on all Bluetooth systems.
-    async fn add_peripheral(&self, address: BDAddr) -> Result<Self::Peripheral>;
+    async fn add_peripheral(&self, address: &PeripheralId) -> Result<Self::Peripheral>;
+
+    /// Clears the list of [`Peripheral`]s that have been discovered so far. Connected peripherals
+    /// should be disconnected before calling this method. On platforms that do not cache peripherals
+    /// locally (e.g. BlueZ on Linux), this is a no-op.
+    async fn clear_peripherals(&self) -> Result<()>;
 
     /// Get information about the Bluetooth adapter being used, such as the model or type.
     ///
     /// The details of this are platform-specific andyou should not attempt to parse it, but it may
     /// be useful for debug logs.
     async fn adapter_info(&self) -> Result<String>;
+
+    /// Get information about the Bluetooth adapter state.
+    async fn adapter_state(&self) -> Result<CentralState>;
 }
 
 /// The Manager is the entry point to the library, providing access to all the Bluetooth adapters on

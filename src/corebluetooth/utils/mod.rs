@@ -16,26 +16,22 @@
 // This file may not be copied, modified, or distributed except
 // according to those terms.
 
-use cocoa::base::id;
-use std::slice;
+use std::ffi::CStr;
+
+use objc2_foundation::{NSString, NSUUID};
 use uuid::Uuid;
 
-use self::nsstring::nsstring_to_string;
-use super::framework::ns;
-
 pub mod core_bluetooth;
-pub mod nsstring;
 
-pub fn nsdata_to_vec(data: id) -> Vec<u8> {
-    let length = ns::data_length(data);
-    if length == 0 {
-        return vec![];
-    }
-    let bytes = ns::data_bytes(data);
-    unsafe { slice::from_raw_parts(bytes, length as usize).to_vec() }
+pub fn nsuuid_to_uuid(uuid: &NSUUID) -> Uuid {
+    uuid.UUIDString().to_string().parse().unwrap()
 }
 
-pub fn nsuuid_to_uuid(uuid: id) -> Uuid {
-    let uuid_nsstring = ns::uuid_uuidstring(uuid);
-    nsstring_to_string(uuid_nsstring).unwrap().parse().unwrap()
+pub unsafe fn nsstring_to_string(nsstring: *const NSString) -> Option<String> {
+    unsafe {
+        nsstring
+            .as_ref()
+            .and_then(|ns| CStr::from_ptr(ns.UTF8String()).to_str().ok())
+            .map(String::from)
+    }
 }

@@ -1,29 +1,43 @@
 use async_trait::async_trait;
 use bluez_async::{
     BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags, CharacteristicId,
-    CharacteristicInfo, DeviceId, DeviceInfo, MacAddress, ServiceInfo, WriteOptions,
+    CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress, ServiceInfo,
+    WriteOptions,
 };
-use futures::future::ready;
+use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
 use serde_cr as serde;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::{self, Display, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::api::{
-    self, AddressType, BDAddr, CharPropFlags, Characteristic, PeripheralProperties, Service,
-    ValueNotification, WriteType,
+    self, AddressType, BDAddr, CharPropFlags, Characteristic, Descriptor, PeripheralProperties,
+    Service, ValueNotification, WriteType,
 };
 use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
+struct CharacteristicInternal {
+    info: CharacteristicInfo,
+    descriptors: HashMap<Uuid, DescriptorInfo>,
+}
+
+impl CharacteristicInternal {
+    fn new(info: CharacteristicInfo, descriptors: HashMap<Uuid, DescriptorInfo>) -> Self {
+        Self { info, descriptors }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ServiceInternal {
     info: ServiceInfo,
-    characteristics: HashMap<Uuid, CharacteristicInfo>,
+    characteristics: HashMap<Uuid, CharacteristicInternal>,
 }
 
 #[cfg_attr(
@@ -34,6 +48,12 @@ struct ServiceInternal {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PeripheralId(pub(crate) DeviceId);
 
+impl Display for PeripheralId {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Implementation of [api::Peripheral](crate::api::Peripheral).
 #[derive(Clone, Debug)]
 pub struct Peripheral {
@@ -41,6 +61,29 @@ pub struct Peripheral {
     device: DeviceId,
     mac_address: BDAddr,
     services: Arc<Mutex<HashMap<Uuid, ServiceInternal>>>,
+}
+
+fn get_characteristic<'a>(
+    services: &'a HashMap<Uuid, ServiceInternal>,
+    service_uuid: &Uuid,
+    characteristic_uuid: &Uuid,
+) -> Result<&'a CharacteristicInternal> {
+    services
+        .get(service_uuid)
+        .ok_or_else(|| {
+            Error::Other(format!("Service with UUID {} not found.", service_uuid).into())
+        })?
+        .characteristics
+        .get(characteristic_uuid)
+        .ok_or_else(|| {
+            Error::Other(
+                format!(
+                    "Characteristic with UUID {} not found.",
+                    characteristic_uuid
+                )
+                .into(),
+            )
+        })
 }
 
 impl Peripheral {
@@ -54,30 +97,30 @@ impl Peripheral {
     }
 
     fn characteristic_info(&self, characteristic: &Characteristic) -> Result<CharacteristicInfo> {
-        let services = self.services.lock().unwrap();
-        services
-            .get(&characteristic.service_uuid)
+        let services = self.services.lock().map_err(Into::<Error>::into)?;
+        get_characteristic(
+            &services,
+            &characteristic.service_uuid,
+            &characteristic.uuid,
+        )
+        .map(|c| &c.info)
+        .cloned()
+    }
+
+    fn descriptor_info(&self, descriptor: &Descriptor) -> Result<DescriptorInfo> {
+        let services = self.services.lock().map_err(Into::<Error>::into)?;
+        let characteristic = get_characteristic(
+            &services,
+            &descriptor.service_uuid,
+            &descriptor.characteristic_uuid,
+        )?;
+        characteristic
+            .descriptors
+            .get(&descriptor.uuid)
             .ok_or_else(|| {
-                Error::Other(
-                    format!(
-                        "Service with UUID {} not found.",
-                        characteristic.service_uuid
-                    )
-                    .into(),
-                )
-            })?
-            .characteristics
-            .get(&characteristic.uuid)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Other(
-                    format!(
-                        "Characteristic with UUID {} not found.",
-                        characteristic.uuid
-                    )
-                    .into(),
-                )
+                Error::Other(format!("Descriptor with UUID {} not found.", descriptor.uuid).into())
             })
+            .cloned()
     }
 
     async fn device_info(&self) -> Result<DeviceInfo> {
@@ -95,17 +138,30 @@ impl api::Peripheral for Peripheral {
         self.mac_address
     }
 
+    fn mtu(&self) -> u16 {
+        let services = self.services.lock().unwrap();
+        for (_, service) in services.iter() {
+            for (_, characteristic) in service.characteristics.iter() {
+                return characteristic.info.mtu.unwrap();
+            }
+        }
+
+        api::DEFAULT_MTU_SIZE
+    }
+
     async fn properties(&self) -> Result<Option<PeripheralProperties>> {
         let device_info = self.device_info().await?;
         Ok(Some(PeripheralProperties {
             address: device_info.mac_address.into(),
             address_type: Some(device_info.address_type.into()),
-            local_name: device_info.name,
+            local_name: device_info.alias.or(device_info.name.clone()),
+            advertisement_name: device_info.name,
             tx_power_level: device_info.tx_power,
             rssi: device_info.rssi,
             manufacturer_data: device_info.manufacturer_data,
             service_data: device_info.service_data,
             services: device_info.services,
+            class: device_info.class,
         }))
     }
 
@@ -138,18 +194,47 @@ impl api::Peripheral for Peripheral {
         let services = self.session.get_services(&self.device).await?;
         for service in services {
             let characteristics = self.session.get_characteristics(&service.id).await?;
+            let characteristics = join_all(
+                characteristics
+                    .into_iter()
+                    .fold(
+                        // Only consider the first characteristic of each UUID
+                        // This "should" be unique, but of course it's not enforced
+                        HashMap::<Uuid, CharacteristicInfo>::new(),
+                        |mut map, characteristic| {
+                            if !map.contains_key(&characteristic.uuid) {
+                                map.insert(characteristic.uuid, characteristic);
+                            }
+                            map
+                        },
+                    )
+                    .into_iter()
+                    .map(|mapped_characteristic| async {
+                        let characteristic = mapped_characteristic.1;
+                        let descriptors = self
+                            .session
+                            .get_descriptors(&characteristic.id)
+                            .await
+                            .unwrap_or(Vec::new())
+                            .into_iter()
+                            .map(|descriptor| (descriptor.uuid, descriptor))
+                            .collect();
+                        CharacteristicInternal::new(characteristic, descriptors)
+                    }),
+            )
+            .await;
             services_internal.insert(
                 service.uuid,
                 ServiceInternal {
                     info: service,
                     characteristics: characteristics
                         .into_iter()
-                        .map(|characteristic| (characteristic.uuid, characteristic))
+                        .map(|characteristic| (characteristic.info.uuid, characteristic))
                         .collect(),
                 },
             );
         }
-        *self.services.lock().unwrap() = services_internal;
+        *(self.services.lock().map_err(Into::<Error>::into)?) = services_internal;
         Ok(())
     }
 
@@ -196,6 +281,27 @@ impl api::Peripheral for Peripheral {
             ready(value_notification(event, &device_id, services.clone()))
         })))
     }
+
+    async fn read_rssi(&self) -> Result<i16> {
+        let device_info = self.device_info().await?;
+        device_info.rssi.ok_or(Error::NotConnected)
+    }
+
+    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
+        let descriptor_info = self.descriptor_info(descriptor)?;
+        Ok(self
+            .session
+            .write_descriptor_value(&descriptor_info.id, data)
+            .await?)
+    }
+
+    async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        let descriptor_info = self.descriptor_info(descriptor)?;
+        Ok(self
+            .session
+            .read_descriptor_value(&descriptor_info.id)
+            .await?)
+    }
 }
 
 fn value_notification(
@@ -209,8 +315,12 @@ fn value_notification(
             event: CharacteristicEvent::Value { value },
         } if id.service().device() == *device_id => {
             let services = services.lock().unwrap();
-            let uuid = find_characteristic_by_id(&services, id)?.uuid;
-            Some(ValueNotification { uuid, value })
+            let (charac, service) = find_characteristic_by_id(&services, id.clone())?;
+            Some(ValueNotification {
+                uuid: charac.uuid,
+                service_uuid: service.uuid,
+                value,
+            })
         }
         _ => None,
     }
@@ -219,11 +329,11 @@ fn value_notification(
 fn find_characteristic_by_id(
     services: &HashMap<Uuid, ServiceInternal>,
     characteristic_id: CharacteristicId,
-) -> Option<&CharacteristicInfo> {
+) -> Option<(&CharacteristicInfo, &ServiceInfo)> {
     for service in services.values() {
         for characteristic in service.characteristics.values() {
-            if characteristic.id == characteristic_id {
-                return Some(characteristic);
+            if characteristic.info.id == characteristic_id {
+                return Some((&characteristic.info, &service.info));
             }
         }
     }
@@ -260,10 +370,30 @@ impl From<bluez_async::AddressType> for AddressType {
     }
 }
 
-fn make_characteristic(info: &CharacteristicInfo, service_uuid: Uuid) -> Characteristic {
+fn make_descriptor(
+    info: &DescriptorInfo,
+    characteristic_uuid: Uuid,
+    service_uuid: Uuid,
+) -> Descriptor {
+    Descriptor {
+        uuid: info.uuid,
+        characteristic_uuid,
+        service_uuid,
+    }
+}
+
+fn make_characteristic(
+    characteristic: &CharacteristicInternal,
+    service_uuid: Uuid,
+) -> Characteristic {
+    let CharacteristicInternal { info, descriptors } = characteristic;
     Characteristic {
         uuid: info.uuid,
         properties: info.flags.into(),
+        descriptors: descriptors
+            .iter()
+            .map(|(_, descriptor)| make_descriptor(descriptor, info.uuid, service_uuid))
+            .collect(),
         service_uuid,
     }
 }
@@ -275,8 +405,8 @@ impl From<&ServiceInternal> for Service {
             primary: service.info.primary,
             characteristics: service
                 .characteristics
-                .iter()
-                .map(|(_, characteristic)| make_characteristic(characteristic, service.info.uuid))
+                .values()
+                .map(|characteristic| make_characteristic(characteristic, service.info.uuid))
                 .collect(),
         }
     }
