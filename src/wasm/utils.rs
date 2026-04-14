@@ -4,10 +4,9 @@ use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-pub async fn wrap_promise<T: From<JsValue>>(promise: Promise) -> Result<T> {
-    match JsFuture::from(promise).await {
-        Ok(value) => Ok(T::from(value)),
-        Err(err) => Err(Error::JavaScript(JsError::from(err).message().into())),
+impl From<JsValue> for Error{
+    fn from(err: JsValue) -> Self {
+        Error::JavaScript(JsError::from(err).message().into())
     }
 }
 

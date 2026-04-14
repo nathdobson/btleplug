@@ -1,7 +1,7 @@
-use super::utils::{uuid_from_string, wrap_promise};
+use super::utils::uuid_from_string;
 use crate::api::{
-    self, BDAddr, CentralEvent, CharPropFlags, Characteristic, PeripheralProperties, Service,
-    ValueNotification, WriteType,
+    self, BDAddr, CentralEvent, CharPropFlags, Characteristic, Descriptor, PeripheralProperties,
+    Service, ValueNotification, WriteType,
 };
 use crate::common::{
     adapter_manager::AdapterManager, util::notifications_stream_from_broadcast_receiver,
@@ -12,13 +12,14 @@ use futures::channel::{mpsc, oneshot};
 use futures::stream::{Stream, StreamExt};
 use js_sys::{Array, DataView, Uint8Array};
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Display;
 use std::fmt::{self, Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::broadcast;
 use uuid::Uuid;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     BluetoothCharacteristicProperties, BluetoothDevice, BluetoothRemoteGattCharacteristic,
@@ -35,6 +36,12 @@ macro_rules! send_cmd {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PeripheralId(String);
+
+impl Display for PeripheralId {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Implementation of [api::Peripheral](crate::api::Peripheral).
 #[derive(Clone)]
@@ -83,14 +90,11 @@ impl SharedExecuter {
             return Ok(());
         }
 
-        wrap_promise::<BluetoothRemoteGattServer>(self.gatt().connect())
-            .await
-            .map(|gatt| {
-                if let Some(manager) = self.manager.upgrade() {
-                    manager.emit(CentralEvent::DeviceConnected(gatt.device().id().into()));
-                }
-                ()
-            })
+        let gatt = self.gatt().connect().await?;
+        if let Some(manager) = self.manager.upgrade() {
+            manager.emit(CentralEvent::DeviceConnected(gatt.device().id().into()));
+        }
+        Ok(())
     }
 
     async fn disconnect(&self) -> Result<()> {
@@ -99,14 +103,14 @@ impl SharedExecuter {
 
     async fn discover_services(&mut self) -> Result<BTreeSet<Service>> {
         self.characteristics.clear();
-        let services = wrap_promise::<Array>(self.gatt().get_primary_services()).await?;
+        let services = self.gatt().get_primary_services().await?;
         let mut ret = BTreeSet::new();
         for service in services.iter() {
             let mut characteristics = BTreeSet::new();
             let service = BluetoothRemoteGattService::from(service);
             let service_uuid = uuid_from_string(service.uuid());
 
-            if let Ok(chars) = wrap_promise::<Array>(service.get_characteristics()).await {
+            if let Ok(chars) = service.get_characteristics().await {
                 for ch in chars.iter() {
                     let ch = BluetoothRemoteGattCharacteristic::from(ch);
                     let uuid = uuid_from_string(ch.uuid());
@@ -114,6 +118,7 @@ impl SharedExecuter {
                         uuid,
                         service_uuid,
                         properties: ch.properties().into(),
+                        descriptors: todo!(),
                     });
                     self.characteristics.insert(uuid, ch);
                 }
@@ -137,23 +142,27 @@ impl SharedExecuter {
 
     async fn write(&self, uuid: Uuid, mut data: Vec<u8>, write_type: WriteType) -> Result<()> {
         let characteristic = self.get_characteristic(uuid)?;
-        wrap_promise::<JsValue>(match write_type {
+        match write_type {
             WriteType::WithResponse => {
-                characteristic.write_value_with_response_with_u8_array(&mut data)
+                characteristic
+                    .write_value_with_response_with_u8_slice(&mut data)?
+                    .await?;
             }
             WriteType::WithoutResponse => {
-                characteristic.write_value_without_response_with_u8_array(&mut data)
+                characteristic
+                    .write_value_without_response_with_u8_slice(&mut data)?
+                    .await?;
             }
-        })
-        .await
-        .map(|_| ())
+        }
+        Ok(())
     }
 
     async fn read(&self, uuid: Uuid) -> Result<Vec<u8>> {
         let characteristic = self.get_characteristic(uuid)?;
-        wrap_promise::<DataView>(characteristic.read_value())
+        Ok(characteristic
+            .read_value()
             .await
-            .map(|value| Uint8Array::new(&value.buffer()).to_vec())
+            .map(|value| Uint8Array::new(&value.buffer()).to_vec())?)
     }
 
     async fn subscribe(&self, uuid: Uuid) -> Result<()> {
@@ -161,17 +170,15 @@ impl SharedExecuter {
         characteristic.set_oncharacteristicvaluechanged(Some(
             self.oncharacteristicvaluechanged.as_ref().unchecked_ref(),
         ));
-        wrap_promise::<JsValue>(characteristic.start_notifications())
-            .await
-            .map(|_| ())
+        characteristic.start_notifications().await?;
+        Ok(())
     }
 
     async fn unsubscribe(&self, uuid: Uuid) -> Result<()> {
         let characteristic = self.get_characteristic(uuid)?;
         characteristic.set_oncharacteristicvaluechanged(None);
-        wrap_promise::<JsValue>(characteristic.stop_notifications())
-            .await
-            .map(|_| ())
+        characteristic.stop_notifications().await?;
+        Ok(())
     }
 
     fn new(
@@ -195,10 +202,12 @@ impl SharedExecuter {
                 value: characteristic
                     .value()
                     .map_or(vec![], |value| Uint8Array::new(&value.buffer()).to_vec()),
+                service_uuid: todo!(),
             };
             // Note: we ignore send errors here which may happen while there are no
             // receivers...
             let _ = notifications_sender.send(notification);
+            ()
         }) as Box<dyn FnMut(Event)>);
 
         SharedExecuter {
@@ -284,7 +293,9 @@ impl api::Peripheral for Peripheral {
     fn id(&self) -> PeripheralId {
         self.shared.id.clone().into()
     }
-
+    fn mtu(&self) -> u16 {
+        todo!();
+    }
     fn address(&self) -> BDAddr {
         BDAddr::default()
     }
@@ -299,6 +310,8 @@ impl api::Peripheral for Peripheral {
             manufacturer_data: HashMap::new(),
             service_data: HashMap::new(),
             services: Vec::new(),
+            advertisement_name: todo!(),
+            class: todo!(),
         }))
     }
 
@@ -349,6 +362,14 @@ impl api::Peripheral for Peripheral {
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         let receiver = self.shared.notifications_channel.subscribe();
         Ok(notifications_stream_from_broadcast_receiver(receiver))
+    }
+
+    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> crate::Result<()> {
+        todo!();
+    }
+
+    async fn read_descriptor(&self, descriptor: &Descriptor) -> crate::Result<Vec<u8>> {
+        todo!();
     }
 }
 

@@ -87,12 +87,12 @@ windows = { version = "0.62", features = ["Devices_Bluetooth", "Devices_Bluetoot
 windows-future = "0.3.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = "0.3.56"
-wasm-bindgen = "0.2.79"
-wasm-bindgen-futures = "0.4.29"
+js-sys = "0.3.95"
+wasm-bindgen = "0.2.118"
+wasm-bindgen-futures = "0.4.68"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "0.3.56"
+version = "0.3.95"
 features = [
   'Bluetooth',
   'BluetoothCharacteristicProperties',

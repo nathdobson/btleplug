@@ -1,3 +1,5 @@
+#![deny(unused_must_use)]
+
 // btleplug Source Code File
 //
 // Copyright 2020 Nonpolynomial Labs LLC. All rights reserved.

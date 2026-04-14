@@ -17,7 +17,7 @@ impl api::Manager for Manager {
     type Adapter = Adapter;
 
     async fn adapters(&self) -> Result<Vec<Adapter>> {
-        if let Some(adapter) = Adapter::try_new() {
+        if let Ok(adapter) = Adapter::try_new() {
             Ok(vec![adapter])
         } else {
             Ok(vec![])

@@ -52,7 +52,7 @@ pub async fn get_adapter() -> &'static Adapter {
                         std::future::pending::<()>().await;
                     });
                 })
-                .expect("failed to spawn adapter thread");
+                .expect("failed to spawn-local adapter thread");
             rx.await
                 .expect("failed to receive adapter from background thread")
         })
