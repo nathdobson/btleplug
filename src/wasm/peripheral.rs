@@ -16,6 +16,7 @@ use std::fmt::Display;
 use std::fmt::{self, Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use serde_cr::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
@@ -34,6 +35,11 @@ macro_rules! send_cmd {
     }};
 }
 
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PeripheralId(String);
 
@@ -112,13 +118,13 @@ impl SharedExecuter {
 
             if let Ok(chars) = service.get_characteristics().await {
                 for ch in chars.iter() {
-                    let ch = BluetoothRemoteGattCharacteristic::from(ch);
                     let uuid = uuid_from_string(ch.uuid());
                     characteristics.insert(Characteristic {
                         uuid,
                         service_uuid,
                         properties: ch.properties().into(),
-                        descriptors: todo!(),
+                        // TODO: copy these descriptors.
+                        descriptors: BTreeSet::new(),
                     });
                     self.characteristics.insert(uuid, ch);
                 }
@@ -202,7 +208,7 @@ impl SharedExecuter {
                 value: characteristic
                     .value()
                     .map_or(vec![], |value| Uint8Array::new(&value.buffer()).to_vec()),
-                service_uuid: todo!(),
+                service_uuid: Uuid::try_from(characteristic.service().uuid()).unwrap(),
             };
             // Note: we ignore send errors here which may happen while there are no
             // receivers...
@@ -252,6 +258,7 @@ impl SharedExecuter {
                 }
             }
         }
+        self.disconnect().await.ok();
     }
 }
 
@@ -310,8 +317,8 @@ impl api::Peripheral for Peripheral {
             manufacturer_data: HashMap::new(),
             service_data: HashMap::new(),
             services: Vec::new(),
-            advertisement_name: todo!(),
-            class: todo!(),
+            advertisement_name: None,
+            class: None,
         }))
     }
 
