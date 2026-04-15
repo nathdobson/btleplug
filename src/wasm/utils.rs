@@ -1,8 +1,7 @@
-use crate::{Error, Result};
-use js_sys::{Error as JsError, Promise};
+use crate::{Error};
+use js_sys::{Error as JsError};
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
 
 impl From<JsValue> for Error{
     fn from(err: JsValue) -> Self {

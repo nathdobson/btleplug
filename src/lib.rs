@@ -1,4 +1,5 @@
 #![deny(unused_must_use)]
+#![allow(dead_code)]
 
 // btleplug Source Code File
 //

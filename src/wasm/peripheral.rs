@@ -10,7 +10,7 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use futures::channel::{mpsc, oneshot};
 use futures::stream::{Stream, StreamExt};
-use js_sys::{Array, DataView, Uint8Array};
+use js_sys::{Uint8Array};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::fmt::{self, Debug, Formatter};
@@ -371,11 +371,11 @@ impl api::Peripheral for Peripheral {
         Ok(notifications_stream_from_broadcast_receiver(receiver))
     }
 
-    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> crate::Result<()> {
+    async fn write_descriptor(&self, _descriptor: &Descriptor, _data: &[u8]) -> crate::Result<()> {
         todo!();
     }
 
-    async fn read_descriptor(&self, descriptor: &Descriptor) -> crate::Result<Vec<u8>> {
+    async fn read_descriptor(&self, _descriptor: &Descriptor) -> crate::Result<Vec<u8>> {
         todo!();
     }
 }

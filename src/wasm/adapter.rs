@@ -9,7 +9,6 @@ use futures::stream::Stream;
 use js_sys::JsString;
 use std::pin::Pin;
 use std::sync::Arc;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BluetoothDevice, BluetoothLeScanFilterInit, RequestDeviceOptions};
 
@@ -95,21 +94,21 @@ impl Central for Adapter {
                 manager.emit(CentralEvent::DeviceDiscovered(id));
             }
 
-            let mut options = RequestDeviceOptions::new();
+            let options = RequestDeviceOptions::new();
             let mut optional_services = Vec::<JsString>::new();
             let mut filters = Vec::<BluetoothLeScanFilterInit>::new();
 
             for uuid in filter.services.iter() {
-                let mut filter = BluetoothLeScanFilterInit::new();
+                let filter = BluetoothLeScanFilterInit::new();
                 let mut filter_services = Vec::<JsString>::new();
                 filter_services.push(uuid.to_string().into());
-                filter.services(&filter_services);
+                filter.set_services(&filter_services);
                 filters.push(filter);
                 optional_services.push(uuid.to_string().into());
             }
 
-            options.filters(&filters);
-            options.optional_services(&optional_services);
+            options.set_filters(&filters);
+            options.set_optional_services(&optional_services);
 
             let device = bluetooth().unwrap().request_device(&options).await?;
 
@@ -135,7 +134,7 @@ impl Central for Adapter {
         self.manager.peripheral(id).ok_or(Error::DeviceNotFound)
     }
 
-    async fn add_peripheral(&self, address: &PeripheralId) -> crate::Result<Self::Peripheral> {
+    async fn add_peripheral(&self, _address: &PeripheralId) -> crate::Result<Self::Peripheral> {
         Err(Error::NotSupported(
             "Can't add a Peripheral from a BDAddr".to_string(),
         ))
