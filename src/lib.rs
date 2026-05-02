@@ -149,7 +149,7 @@ pub enum Error {
     #[error("Invalid Bluetooth address: {0}")]
     InvalidBDAddr(#[from] ParseBDAddrError),
 
-    #[error("JavaScript {:?}", _0)]
+    #[error("javascript error: {0}")]
     JavaScript(String),
 
     #[error("Runtime Error: {}", _0)]
